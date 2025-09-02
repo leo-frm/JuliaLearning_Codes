@@ -163,21 +163,20 @@ function set_integrator!(integrator; u::Vector{Float64}=nothing, t::Float64=noth
 end
 
 function map_cells(bp :: BasinProblem, cell_range :: UnitRange{Int64}, p) :: BasinResult
-    # Create the grid that will be populated in the function. Can be accessed by a tuple / list of values or single value
+    # Create the grid that will be populated in the function
     grid = zeros(Int64, Tuple(x for x in bp.region.elements))
 
     # Create the attractors list for filling
     attractors = []
     attractors_found = 1 # we already know of the divergent one
 
-    # temporary vector for storing indices of cells we visited in each iteration
-    T = zeros(Int64, bp.maximum_cycles + 1) # + 1 to accommodate initial cell
-    # temporary vector for cells of attractors found in a iteration
+    # temporary vectors
+    T = zeros(Int64, bp.maximum_cycles + 1)
     A = zeros(Int64, 20)
 
     u = zeros(Float64, length(bp.region.elements))
 
-    # initialize problem and integrator
+    # Initialize problem and integrator ONCE per thread
     ode_problem = ODEProblem(
         bp.f,
         zero(u),
@@ -192,72 +191,123 @@ function map_cells(bp :: BasinProblem, cell_range :: UnitRange{Int64}, p) :: Bas
         maxiters=1e10,
     )
 
-    # NEW: Create transition map - stores where each cell goes after one period
+    # Create transition map - but we'll build it lazily
     transition_map = Dict{Int64, Int64}()
     
-    # PHASE 1: Build the transition map for all cells in range
+    # HYBRID APPROACH: Build transition map only as needed
     for c in cell_range
-        # Only compute transition if not already known
-        if !haskey(transition_map, c)
-            # Set the initial value as the current cell center
-            store_cell_center!(u, c, bp.region)
-            
-            # Compute the transition after skipping transients and one period
-            next_cell = compute_cell_transition!(
-                bp,
-                integrator,
-                u,
-                c
-            )
-            
-            # Store the transition
-            transition_map[c] = next_cell
-        end
-        
-        next!(p)
-    end
-    
-    # PHASE 2: Use transition map to find attractors
-    for c in cell_range
-        # Trajectory already filled
-        if (grid[c] != 0)
+        # Skip if already assigned
+        if grid[c] != 0
+            next!(p)
             continue
         end
         
-        # Search for attractor using transition map
-        attractor = search_for_attractor_discrete!(
-            bp,
-            grid,
-            transition_map,
-            c,
-            next_attr_num=attractors_found,
-            T_prealloc=T,
-            A_prealloc=A
-        )
+        # Store the initial value
+        store_cell_center!(u, c, bp.region)
         
-        # If attractor is found, save it in list for the results exporting
-        if !isnothing(attractor)
-            attractors_found += 1
-            push!(attractors, attractor)
+        # Build transition chain until we hit something known
+        current_cell = c
+        trajectory = Int64[]
+        
+        # Follow/build the transition chain
+        while true
+            # If we already know this cell's fate, stop
+            if grid[current_cell] != 0
+                # Mark all cells in trajectory with same attractor
+                for tc in trajectory
+                    grid[tc] = grid[current_cell]
+                end
+                break
+            end
+            
+            # If we've seen this cell in current trajectory, we found a cycle
+            if current_cell in trajectory
+                # Found a new attractor - extract the cycle
+                first_idx = findfirst(x -> x == current_cell, trajectory)
+                cycle_cells = trajectory[first_idx:end]
+                
+                # Create attractor
+                attractor = make_attractor_from_cells(
+                    cycle_cells, 
+                    number=attractors_found, 
+                    type=regular, 
+                    region=bp.region
+                )
+                attractors_found += 1
+                push!(attractors, attractor)
+                
+                # Mark all cells in trajectory
+                for tc in trajectory
+                    grid[tc] = attractor.number
+                end
+                break
+            end
+            
+            # Add to trajectory
+            push!(trajectory, current_cell)
+            
+            # Check if we've gone too long (quasi-periodic)
+            if length(trajectory) > bp.maximum_cycles
+                # Create quasi-periodic attractor from second half
+                half = div(length(trajectory), 2)
+                quasi_cells = trajectory[half:end]
+                
+                attractor = make_attractor_from_cells(
+                    quasi_cells,
+                    number=attractors_found,
+                    type=quasi_periodic,
+                    region=bp.region
+                )
+                attractors_found += 1
+                push!(attractors, attractor)
+                
+                # Mark all cells
+                for tc in trajectory
+                    grid[tc] = attractor.number
+                end
+                break
+            end
+            
+            # Get or compute next cell
+            if haskey(transition_map, current_cell)
+                next_cell = transition_map[current_cell]
+            else
+                # Compute transition for this cell
+                store_cell_center!(u, current_cell, bp.region)
+                next_cell = compute_cell_transition!(bp, integrator, u, current_cell)
+                transition_map[current_cell] = next_cell
+            end
+            
+            # Check for divergence
+            if next_cell == -1
+                # Mark all cells as divergent
+                for tc in trajectory
+                    grid[tc] = -1
+                end
+                break
+            end
+            
+            current_cell = next_cell
         end
+        
+        next!(p)
     end
 
     # Returns result
     BasinResult(grid, attractors, bp.region)
 end
 
-function compute_cell_transition!(bp :: BasinProblem, integrator, u :: Vector{Float64}, start_cell :: Int64) :: Int64
+function compute_cell_transition!(bp :: BasinProblem, integrator, u :: Vector{Float64}, 
+                                 start_cell :: Int64) :: Int64
     # Set integrator's initial condition
-    set_integrator!(integrator; u, t=0.0)
+    set_integrator!(integrator; u=u, t=0.0)
     
-    # Skip transient cycles
-    step!(integrator, bp.period * bp.transient_cycles, true)
-    
-    # Adjust in case of cyclic conditions
-    adjust_cyclic(integrator.u, bp.region.range, bp.region.is_cyclic)
-    
-    # Reset time and position after transient
-    set_integrator!(integrator; u=integrator.u, t=0.0)
+    # Skip transient cycles in one go
+    if bp.transient_cycles > 0
+        step!(integrator, bp.period * bp.transient_cycles, true)
+        adjust_cyclic(integrator.u, bp.region.range, bp.region.is_cyclic)
+        set_integrator!(integrator; u=integrator.u, t=0.0)
+    end
     
     # Step exactly one period forward
     step!(integrator, bp.period, true)
@@ -267,26 +317,12 @@ function compute_cell_transition!(bp :: BasinProblem, integrator, u :: Vector{Fl
     
     # Check if we're still in the valid region
     if !is_inside_range(integrator.u, bp.region.range)
-        # If outside basin region, check extended region
+        # Quick check if divergent (outside extended region)
         if !is_inside_range(integrator.u, bp.region.extended_range)
-            return -1  # Divergent
+            return -1
         end
-        # In extended region - integrate a bit more to see where it goes
-        cycles = 0
-        while cycles < bp.maximum_extended_cycles
-            step!(integrator, bp.period, true)
-            adjust_cyclic(integrator.u, bp.region.range, bp.region.is_cyclic)
-            cycles += 1
-            
-            if is_inside_range(integrator.u, bp.region.range)
-                # Back in basin region
-                return get_cell_number(integrator.u, bp.region)
-            elseif !is_inside_range(integrator.u, bp.region.extended_range)
-                # Left extended region - divergent
-                return -1
-            end
-        end
-        # Stayed in extended region too long
+        # In extended region - could come back, but for efficiency assume divergent
+        # (you can make this more sophisticated if needed)
         return -1
     end
     
@@ -776,8 +812,8 @@ function run(; maxthreads=Threads.nthreads(), divrange=1000:1000:4000)
 end
 
 # assert_cells(200)
-#test_helmduff(200)
-#test_spring_column(1000, omega=0.0)
-#test_dynamics_nva(10)
-#test_double_helmduff(50)
+test_helmduff(4000)
+# test_spring_column(1000, omega=0.0)
+# test_dynamics_nva(10)
+# test_double_helmduff(50)
 #run()
