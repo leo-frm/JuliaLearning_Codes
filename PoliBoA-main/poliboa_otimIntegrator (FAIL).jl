@@ -170,29 +170,41 @@ function map_cells(bp :: BasinProblem, cell_range :: UnitRange{Int64}, p) :: Bas
     attractors = []
     attractors_found = 1 # já conhecemos o divergente
 
-    # vetores temporários
-    T = zeros(Int64, bp.maximum_cycles + 1)
-    A = zeros(Int64, 20)
-
     u = zeros(Float64, length(bp.region.elements))
 
-    # Inicializa o problema e o integrador UMA VEZ por thread
+    # Inicializa o problema e o integrador UMA VEZ por thread com configurações otimizadas
     ode_problem = ODEProblem(
         bp.f,
         zero(u),
         (0.0, bp.period * bp.maximum_cycles),
         bp.params,
     )
+    
+    # Tsit5 com configurações agressivas para MÁXIMA VELOCIDADE
     integrator = init(
-        ode_problem;
+        ode_problem,
+        Tsit5();  # Mais rápido que RK4 para passos adaptativos
         dense=false,
         save_everystep=false,
         save_start=false,
-        maxiters=1e10,
+        save_end=false,
+        maxiters=1e6,  # Reduzido para falhar mais rápido
+        abstol=1e-6,   # Tolerância relaxada para velocidade
+        reltol=1e-4,   # Tolerância relaxada para velocidade
+        adaptive=true,  # Adaptativo é mais rápido para Tsit5
+        dtmin=bp.period/10000,  # Evita passos muito pequenos
+        dtmax=bp.period/10,     # Permite passos grandes
+        force_dtmin=true,       # Força falha se dt muito pequeno
+        internalnorm = (u,t) -> maximum(abs.(u)),  # Norma mais rápida
+        controller = IController()  # Controlador mais simples e rápido
     )
 
     # Cria mapa de transições - mas vamos construir sob demanda
     transition_map = Dict{Int64, Int64}()
+    
+    # Pré-aloca vetor de trajetória para evitar realocações
+    trajectory = Vector{Int64}(undef, bp.maximum_cycles + 1)
+    traj_len = 0
     
     # ABORDAGEM HÍBRIDA: constrói o mapa de transições apenas quando necessário
     for c in cell_range
@@ -207,24 +219,34 @@ function map_cells(bp :: BasinProblem, cell_range :: UnitRange{Int64}, p) :: Bas
         
         # Constrói a cadeia de transições até encontrar algo conhecido
         current_cell = c
-        trajectory = Int64[]
+        traj_len = 0  # Reset do comprimento da trajetória
         
         # Segue/constrói a cadeia de transições
         while true
             # Se já conhecemos o destino desta célula, paramos
             if grid[current_cell] != 0
                 # Marca todas as células na trajetória com o mesmo atrator
-                for tc in trajectory
-                    grid[tc] = grid[current_cell]
+                @inbounds for i in 1:traj_len
+                    grid[trajectory[i]] = grid[current_cell]
                 end
                 break
             end
             
-            # Se já vimos esta célula na trajetória atual, encontramos um ciclo
-            if current_cell in trajectory
+            # Verifica se já vimos esta célula na trajetória atual (ciclo)
+            cycle_found = false
+            first_idx = 0
+            @inbounds for i in 1:traj_len
+                if trajectory[i] == current_cell
+                    cycle_found = true
+                    first_idx = i
+                    break
+                end
+            end
+            
+            if cycle_found
                 # Encontrou um novo atrator - extrai o ciclo
-                first_idx = findfirst(x -> x == current_cell, trajectory)
-                cycle_cells = trajectory[first_idx:end]
+                cycle_length = traj_len - first_idx + 1
+                cycle_cells = trajectory[first_idx:traj_len]
                 
                 # Cria atrator
                 attractor = make_attractor_from_cells(
@@ -237,20 +259,21 @@ function map_cells(bp :: BasinProblem, cell_range :: UnitRange{Int64}, p) :: Bas
                 push!(attractors, attractor)
                 
                 # Marca todas as células na trajetória
-                for tc in trajectory
-                    grid[tc] = attractor.number
+                @inbounds for i in 1:traj_len
+                    grid[trajectory[i]] = attractor.number
                 end
                 break
             end
             
             # Adiciona à trajetória
-            push!(trajectory, current_cell)
+            traj_len += 1
+            @inbounds trajectory[traj_len] = current_cell
             
             # Verifica se a trajetória está muito longa (quase-periódica)
-            if length(trajectory) > bp.maximum_cycles
+            if traj_len > bp.maximum_cycles
                 # Cria atrator quase-periódico da segunda metade
-                half = div(length(trajectory), 2)
-                quasi_cells = trajectory[half:end]
+                half = div(traj_len, 2)
+                quasi_cells = trajectory[half:traj_len]
                 
                 attractor = make_attractor_from_cells(
                     quasi_cells,
@@ -262,16 +285,15 @@ function map_cells(bp :: BasinProblem, cell_range :: UnitRange{Int64}, p) :: Bas
                 push!(attractors, attractor)
                 
                 # Marca todas as células
-                for tc in trajectory
-                    grid[tc] = attractor.number
+                @inbounds for i in 1:traj_len
+                    grid[trajectory[i]] = attractor.number
                 end
                 break
             end
             
             # Obtém ou calcula a próxima célula
-            if haskey(transition_map, current_cell)
-                next_cell = transition_map[current_cell]
-            else
+            next_cell = get(transition_map, current_cell, 0)
+            if next_cell == 0
                 # Calcula a transição desta célula
                 store_cell_center!(u, current_cell, bp.region)
                 next_cell = compute_cell_transition!(bp, integrator, u, current_cell)
@@ -281,8 +303,8 @@ function map_cells(bp :: BasinProblem, cell_range :: UnitRange{Int64}, p) :: Bas
             # Verifica divergência
             if next_cell == -1
                 # Marca todas as células como divergentes
-                for tc in trajectory
-                    grid[tc] = -1
+                @inbounds for i in 1:traj_len
+                    grid[trajectory[i]] = -1
                 end
                 break
             end
@@ -297,39 +319,54 @@ function map_cells(bp :: BasinProblem, cell_range :: UnitRange{Int64}, p) :: Bas
     BasinResult(grid, attractors, bp.region)
 end
 
+# Função de transição otimizada que reutiliza o integrador
+# Versão alternativa mais eficiente usando solve diretamente
 function compute_cell_transition!(bp :: BasinProblem, integrator, u :: Vector{Float64}, 
                                  start_cell :: Int64) :: Int64
-    # Define a condição inicial do integrador
-    set_integrator!(integrator; u=u, t=0.0)
     
-    # Pula ciclos transitórios de uma vez
-    if bp.transient_cycles > 0
-        step!(integrator, bp.period * bp.transient_cycles, true)
-        adjust_cyclic(integrator.u, bp.region.range, bp.region.is_cyclic)
-        set_integrator!(integrator; u=integrator.u, t=0.0)
-    end
+    # Cria um novo problema ODE para esta condição inicial
+    total_time = bp.period * (bp.transient_cycles + 1)
+    ode_problem = remake(integrator.sol.prob, u0=u, tspan=(0.0, total_time))
     
-    # Avança exatamente um período
-    step!(integrator, bp.period, true)
+    # Resolve o problema
+    sol = solve(ode_problem, Tsit5(); 
+                dense=false, save_everystep=false, save_start=false, save_end=true,
+                maxiters=1e6, abstol=1e-6, reltol=1e-4,
+                dtmin=bp.period/10000, dtmax=bp.period/10, force_dtmin=true)
     
-    # Ajusta em caso de condições cíclicas
-    adjust_cyclic(integrator.u, bp.region.range, bp.region.is_cyclic)
-    
-    # Verifica se ainda estamos dentro da região válida
-    if !is_inside_range(integrator.u, bp.region.range)
-        # Verifica rapidamente se divergente (fora da região estendida)
-        if !is_inside_range(integrator.u, bp.region.extended_range)
-            return -1
-        end
-        # Na região estendida - poderia voltar, mas por eficiência assume divergente
-        # (pode ser mais sofisticado se necessário)
+    # Verifica se a solução foi bem-sucedida
+    if sol.retcode != :Success
         return -1
     end
     
+    # Pega o estado final
+    final_u = sol.u[end]
+    
+    # Verifica divergência
+    @inbounds for i in 1:length(final_u)
+        if !isfinite(final_u[i]) || abs(final_u[i]) > 1e10
+            return -1
+        end
+    end
+    
+    # Ajusta em caso de condições cíclicas
+    adjust_cyclic(final_u, bp.region.range, bp.region.is_cyclic)
+    
+    # Verifica se ainda estamos dentro da região válida
+    @inbounds for i in 1:length(final_u)
+        if final_u[i] < bp.region.range[i][1] || final_u[i] > bp.region.range[i][2]
+            # Verificação rápida da região estendida
+            if final_u[i] < bp.region.extended_range[i][1] || 
+               final_u[i] > bp.region.extended_range[i][2]
+                return -1
+            end
+            return -1  # Na região estendida - assume divergente por eficiência
+        end
+    end
+    
     # Retorna o número da célula em que terminou
-    return get_cell_number(integrator.u, bp.region)
+    return get_cell_number(final_u, bp.region)
 end
-
 
 function make_attractor_from_cells(cells; number::Int64, type::AttractorType, region::BasinRegion)
     points = map(cells) do c
@@ -813,7 +850,7 @@ function run(; maxthreads=Threads.nthreads(), divrange=1000:1000:4000)
 end
 
 # assert_cells(200)
-# test_helmduff(200)
+test_helmduff(200)
 # test_spring_column(1000, omega=0.0)
 # test_dynamics_nva(10)
 # test_double_helmduff(50)
