@@ -110,17 +110,27 @@ function compare_basins(result_a::BasinResult, result_b::BasinResult) :: Float64
         pair_counts[key] = get(pair_counts, key, 0) + 1
     end
 
-    # Para cada atrator de A, encontra o melhor match em B
-    best_match = Dict{Int64, Tuple{Int64, Int64}}() # a_id -> (b_id, count)
-    for ((a_id, b_id), count) in pair_counts
-        if !haskey(best_match, a_id) || count > best_match[a_id][2]
-            best_match[a_id] = (b_id, count)
+    # Divergente é caso à parte: -1 sempre casa com -1, sem disputar com os atratores reais
+    mapping = Dict{Int64, Int64}(-1 => -1)
+
+    # Pares candidatos (excluindo o divergente), ordenados por sobreposição decrescente
+    candidates = [(a_id, b_id, count) for ((a_id, b_id), count) in pair_counts
+                  if a_id != -1 && b_id != -1]
+    sort!(candidates, by = x -> -x[3])
+
+    # Atribuição gulosa bijetiva: cada atrator de A casa com no máximo um de B, e vice-versa
+    used_a = Set{Int64}()
+    used_b = Set{Int64}()
+    for (a_id, b_id, _) in candidates
+        if a_id ∉ used_a && b_id ∉ used_b
+            mapping[a_id] = b_id
+            push!(used_a, a_id)
+            push!(used_b, b_id)
         end
     end
 
-    # Conta células que batem com o melhor mapeamento
-    mapping = Dict(a_id => bm[1] for (a_id, bm) in best_match)
-    matches = count(i -> get(mapping, cells_a[i], -1) == cells_b[i], eachindex(cells_a))
+    # Conta células que batem com o mapeamento
+    matches = count(i -> get(mapping, cells_a[i], nothing) == cells_b[i], eachindex(cells_a))
 
     return matches / total
 end
